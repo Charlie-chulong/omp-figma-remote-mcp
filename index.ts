@@ -14,12 +14,12 @@
  *   /figma-remote-auth  — run OAuth authentication
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type, type TSchema } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { Type, type TSchema } from "typebox";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { createServer, type Server } from "node:http";
+import { startOAuthCallback } from "./oauth-callback.js";
 import { randomBytes, createHash } from "node:crypto";
 
 // ## Config
@@ -34,8 +34,78 @@ const OAUTH_CALLBACK_PORT = 9876;
 const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CALLBACK_PORT}/callback`;
 const OAUTH_REGISTRATION_URL = "https://api.figma.com/v1/oauth/mcp/register";
 
-// ## State
+interface McpTool {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: string;
+    properties?: Record<
+      string,
+      {
+        type: string;
+        description?: string;
+        enum?: string[];
+        items?: unknown;
+        default?: unknown;
+      }
+    >;
+    required?: string[];
+  };
+}
+export function buildSchema(inputSchema: McpTool["inputSchema"]): TSchema {
+  const props = inputSchema.properties ?? {};
+  const required = new Set(inputSchema.required ?? []);
+  const fields: Record<string, TSchema> = {};
 
+  for (const [key, prop] of Object.entries(props)) {
+    let schema: TSchema;
+    // Constructor metadata works with both TypeBox and OMP's callable facade.
+    const options = prop.description ? { description: prop.description } : undefined;
+
+    if (prop.enum) {
+      schema = Type.Union(prop.enum.map((v) => Type.Literal(v)), options);
+    } else if (prop.type === "boolean") {
+      schema = Type.Boolean(options);
+    } else if (prop.type === "number" || prop.type === "integer") {
+      schema = Type.Number(options);
+    } else if (prop.type === "array") {
+      schema = Type.Array(Type.Any(), options);
+    } else {
+      schema = Type.String(options);
+    }
+
+    fields[key] = required.has(key) ? schema : Type.Optional(schema);
+  }
+
+  return Type.Object(fields);
+}
+
+function networkFailureSummary(error: unknown): string {
+  const parts: string[] = [];
+  let cause = error;
+  for (let depth = 0; depth < 4 && cause instanceof Error; depth++) {
+    const name = /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(cause.name) ? cause.name : "Error";
+    const code = "code" in cause && typeof cause.code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(cause.code) ? cause.code : undefined;
+    parts.push(code ? `${name}[${code}]` : name);
+    cause = cause.cause;
+  }
+  return parts.join(" <- ") || typeof error;
+}
+
+type McpFailureDetails =
+  | { stage: "http-request"; causes: string }
+  | { stage: "json-rpc"; code: number | undefined };
+
+class McpFailure extends Error {
+  constructor(message: string, readonly details: McpFailureDetails, cause: unknown) {
+    super(message, { cause });
+  }
+}
+
+export default function (pi: ExtensionAPI) {
+const lifecycle = new AbortController();
+let authPending = false;
+let authController: AbortController | undefined;
 let sessionId: string | undefined;
 let requestId = 1;
 let connected = false;
@@ -46,6 +116,17 @@ let clientId: string | undefined;
 let clientSecret: string | undefined;
 let tokenExpiresAt = 0;
 
+async function fetch(input: Parameters<typeof globalThis.fetch>[0], init: RequestInit = {}) {
+  const signals = [lifecycle.signal];
+  if (init.signal) signals.push(init.signal);
+  try {
+    return await globalThis.fetch(input, { ...init, signal: AbortSignal.any(signals) });
+  } catch (error) {
+    if (lifecycle.signal.aborted || init.signal?.aborted) throw error;
+    const causes = networkFailureSummary(error);
+    throw new McpFailure(`HTTP request failed: ${causes}`, { stage: "http-request", causes }, error);
+  }
+}
 // ## Token persistence
 
 interface TokenData {
@@ -105,6 +186,7 @@ async function registerOAuthClient(): Promise<{
 }> {
   const res = await fetch(OAUTH_REGISTRATION_URL, {
     method: "POST",
+    signal: authController?.signal,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_name: "Claude Code",
@@ -116,8 +198,7 @@ async function registerOAuthClient(): Promise<{
     }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Client registration failed (${res.status}): ${text}`);
+    throw new Error(`Client registration failed (${res.status})`);
   }
   const data = (await res.json()) as {
     client_id: string;
@@ -126,70 +207,6 @@ async function registerOAuthClient(): Promise<{
   return { clientId: data.client_id, clientSecret: data.client_secret ?? "" };
 }
 
-async function waitForAuthCode(
-  state: string
-): Promise<{ code: string; state: string }> {
-  return new Promise((resolve, reject) => {
-    let server: Server;
-    const timeout = setTimeout(() => {
-      server?.close();
-      reject(new Error("OAuth timeout — no callback received within 120s"));
-    }, 120_000);
-
-    server = createServer((req, res) => {
-      const url = new URL(
-        req.url!,
-        `http://localhost:${OAUTH_CALLBACK_PORT}`
-      );
-      if (url.pathname !== "/callback") {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-
-      const code = url.searchParams.get("code");
-      const returnedState = url.searchParams.get("state");
-      const error = url.searchParams.get("error");
-
-      if (error) {
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(
-          `<html><body><h2>Authentication failed</h2><p>${error}</p><p>You can close this tab.</p></body></html>`
-        );
-        clearTimeout(timeout);
-        server.close();
-        reject(new Error(`OAuth error: ${error}`));
-        return;
-      }
-
-      if (!code || returnedState !== state) {
-        res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(
-          `<html><body><h2>Invalid callback</h2><p>You can close this tab.</p></body></html>`
-        );
-        return;
-      }
-
-      res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(
-        `<html><body><h2>Authenticated with Figma ✓</h2><p>You can close this tab and return to pi.</p></body></html>`
-      );
-      clearTimeout(timeout);
-      server.close();
-      resolve({ code, state: returnedState });
-    });
-
-    server.listen(OAUTH_CALLBACK_PORT, () => {});
-    server.on("error", (err) => {
-      clearTimeout(timeout);
-      reject(
-        new Error(
-          `Could not start OAuth callback server on port ${OAUTH_CALLBACK_PORT}: ${err.message}`
-        )
-      );
-    });
-  });
-}
 
 async function exchangeCodeForToken(
   code: string,
@@ -206,13 +223,13 @@ async function exchangeCodeForToken(
 
   const res = await fetch(OAUTH_TOKEN_URL, {
     method: "POST",
+    signal: authController?.signal,
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(params).toString(),
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token exchange failed (${res.status}): ${text}`);
+    throw new Error(`Token exchange failed (${res.status})`);
   }
 
   const data = (await res.json()) as {
@@ -229,12 +246,13 @@ async function exchangeCodeForToken(
   saveToken();
 }
 
-async function refreshAccessToken(): Promise<boolean> {
+async function refreshAccessToken(signal?: AbortSignal): Promise<boolean> {
   if (!refreshToken || !clientId) return false;
 
   try {
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
+      signal,
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "refresh_token",
@@ -267,36 +285,29 @@ async function refreshAccessToken(): Promise<boolean> {
 async function runFullOAuthFlow(ctx: {
   ui: { notify: (msg: string, level: string) => void };
 }): Promise<boolean> {
-  ctx.ui.notify("Registering with Figma MCP server...", "info");
+  ctx.ui.notify("正在注册 Figma 授权客户端…", "info");
   const reg = await registerOAuthClient();
   clientId = reg.clientId;
   clientSecret = reg.clientSecret;
-
   const codeVerifier = generateCodeVerifier();
-  const codeChallenge = generateCodeChallenge(codeVerifier);
   const state = randomBytes(16).toString("hex");
-
   const authUrl = new URL(OAUTH_AUTHORIZATION_URL);
   authUrl.searchParams.set("client_id", clientId);
   authUrl.searchParams.set("redirect_uri", OAUTH_REDIRECT_URI);
   authUrl.searchParams.set("response_type", "code");
   authUrl.searchParams.set("scope", "mcp:connect");
   authUrl.searchParams.set("state", state);
-  authUrl.searchParams.set("code_challenge", codeChallenge);
+  authUrl.searchParams.set("code_challenge", generateCodeChallenge(codeVerifier));
   authUrl.searchParams.set("code_challenge_method", "S256");
-
-  ctx.ui.notify(
-    `Opening browser for Figma authentication...\n\nIf the browser doesn't open, visit:\n${authUrl.toString()}`,
-    "info"
-  );
-
-  const { exec } = await import("node:child_process");
-  exec(`open "${authUrl.toString()}"`);
-
-  const { code } = await waitForAuthCode(state);
-  await exchangeCodeForToken(code, codeVerifier);
-
-  return true;
+  const callback = await startOAuthCallback(state, OAUTH_CALLBACK_PORT, AbortSignal.any([lifecycle.signal, authController!.signal]));
+  try {
+    ctx.ui.notify(`请在浏览器打开以下 Figma 授权链接：\n${authUrl}\n\n取消：/figma-remote-auth cancel`, "info");
+    const { code } = await callback.code;
+    await exchangeCodeForToken(code, codeVerifier);
+    return true;
+  } finally {
+    callback.close();
+  }
 }
 
 // ## MCP HTTP client
@@ -307,7 +318,7 @@ async function mcpPost(
   signal?: AbortSignal
 ): Promise<unknown> {
   if (tokenExpiresAt > 0 && Date.now() > tokenExpiresAt - 60_000) {
-    await refreshAccessToken();
+    await refreshAccessToken(signal);
   }
 
   const id = requestId++;
@@ -330,7 +341,7 @@ async function mcpPost(
 
   if (!response.ok) {
     if (response.status === 401) {
-      const refreshed = await refreshAccessToken();
+      const refreshed = await refreshAccessToken(signal);
       if (refreshed) {
         const retryHeaders = {
           ...headers,
@@ -353,7 +364,7 @@ async function mcpPost(
 
         const ct = retry.headers.get("content-type") ?? "";
         const txt = await retry.text();
-        let j: { result?: unknown; error?: { message: string } };
+        let j: { result?: unknown; error?: { message: string; code?: number } };
         if (ct.includes("text/event-stream")) {
           const dl = txt.split("\n").find((l) => l.startsWith("data: "));
           if (!dl) throw new Error("No data in SSE response");
@@ -361,7 +372,10 @@ async function mcpPost(
         } else {
           j = JSON.parse(txt);
         }
-        if (j.error) throw new Error(j.error.message);
+        if (j.error) {
+          const code = typeof j.error.code === "number" ? j.error.code : undefined;
+          throw new McpFailure(`JSON-RPC error${code !== undefined ? ` (${code})` : ""}: ${j.error.message}`, { stage: "json-rpc", code }, j.error);
+        }
         return j.result;
       }
       throw new Error("AUTH_REQUIRED");
@@ -372,7 +386,7 @@ async function mcpPost(
   const contentType = response.headers.get("content-type") ?? "";
   const text = await response.text();
 
-  let json: { result?: unknown; error?: { message: string } };
+  let json: { result?: unknown; error?: { message: string; code?: number } };
 
   if (contentType.includes("text/event-stream")) {
     const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
@@ -382,7 +396,10 @@ async function mcpPost(
     json = JSON.parse(text);
   }
 
-  if (json.error) throw new Error(json.error.message);
+  if (json.error) {
+    const code = typeof json.error.code === "number" ? json.error.code : undefined;
+    throw new McpFailure(`JSON-RPC error${code !== undefined ? ` (${code})` : ""}: ${json.error.message}`, { stage: "json-rpc", code }, json.error);
+  }
   return json.result;
 }
 
@@ -410,24 +427,6 @@ async function initializeSession(signal?: AbortSignal): Promise<boolean> {
 
 // ## Tool discovery
 
-interface McpTool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties?: Record<
-      string,
-      {
-        type: string;
-        description?: string;
-        enum?: string[];
-        items?: unknown;
-        default?: unknown;
-      }
-    >;
-    required?: string[];
-  };
-}
 
 interface McpContent {
   type: "text" | "image" | "resource";
@@ -446,7 +445,8 @@ async function listTools(signal?: AbortSignal): Promise<McpTool[]> {
   const result = (await mcpPost("tools/list", undefined, signal)) as {
     tools: McpTool[];
   };
-  return result.tools ?? [];
+  // Keep OMP's native image tool; the unused Figma tool shadows the same name.
+  return (result.tools ?? []).filter((tool) => tool.name !== "generate_image");
 }
 
 async function callTool(
@@ -492,33 +492,6 @@ function convertContent(
 
 // ## Schema builder
 
-function buildSchema(inputSchema: McpTool["inputSchema"]): TSchema {
-  const props = inputSchema.properties ?? {};
-  const required = new Set(inputSchema.required ?? []);
-  const fields: Record<string, TSchema> = {};
-
-  for (const [key, prop] of Object.entries(props)) {
-    let schema: TSchema;
-
-    if (prop.enum) {
-      schema = Type.Union(prop.enum.map((v) => Type.Literal(v)));
-    } else if (prop.type === "boolean") {
-      schema = Type.Boolean();
-    } else if (prop.type === "number" || prop.type === "integer") {
-      schema = Type.Number();
-    } else if (prop.type === "array") {
-      schema = Type.Array(Type.Any());
-    } else {
-      schema = Type.String();
-    }
-
-    const description = prop.description ?? "";
-    const withDesc = description ? { ...schema, description } : schema;
-    fields[key] = required.has(key) ? withDesc : Type.Optional(withDesc);
-  }
-
-  return Type.Object(fields);
-}
 
 // ## Tool registration
 
@@ -592,6 +565,7 @@ function registerMcpTools(pi: ExtensionAPI, tools: McpTool[]) {
               { type: "text", text: `Figma remote MCP error: ${msg}` },
             ],
             isError: true,
+            details: err instanceof McpFailure ? { figmaFailure: err.details } : undefined,
           };
         }
       },
@@ -601,36 +575,34 @@ function registerMcpTools(pi: ExtensionAPI, tools: McpTool[]) {
 
 // ## Extension
 
-export default function (pi: ExtensionAPI) {
   // ## Lifecycle
 
-  pi.on("session_start", async (_event, ctx) => {
-    (async () => {
-      const signal = AbortSignal.timeout(10_000);
-      try {
-        if (!loadToken()) {
-          connected = false;
-          ctx.ui.setStatus("figma-remote", "figma-remote ○");
-          return;
-        }
-
-        const ok = await initializeSession(signal);
-        if (!ok) {
-          connected = false;
-          ctx.ui.setStatus("figma-remote", "figma-remote ✗");
-          return;
-        }
-
-        const tools = await listTools(signal);
-        connected = true;
-        ctx.ui.setStatus("figma-remote", "figma-remote ✓");
-        registerMcpTools(pi, tools);
-      } catch {
-        connected = false;
-        ctx.ui.setStatus("figma-remote", "figma-remote ✗");
-      }
-    })();
+  pi.on("session_shutdown", () => {
+    authController?.abort();
+    lifecycle.abort();
+    connected = false;
+    sessionId = undefined;
   });
+  async function reconnect(_event, ctx) {
+    const signal = AbortSignal.timeout(10_000);
+    connected = false;
+    sessionId = undefined;
+    if (!loadToken()) return;
+    try {
+      const ok = await initializeSession(signal);
+      if (!ok) {
+        ctx.ui.notify("Figma 登录已过期，请运行 /figma-remote-auth 重新授权。", "warning");
+        return;
+      }
+      const tools = await listTools(signal);
+      connected = true;
+      registerMcpTools(pi, tools);
+    } catch (error) {
+      if (!lifecycle.signal.aborted) ctx.ui.notify(`Figma 连接失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  }
+  pi.on("session_start", reconnect);
+  pi.on("session_switch", reconnect);
 
   // ## System prompt
 
@@ -638,20 +610,20 @@ export default function (pi: ExtensionAPI) {
     if (!connected) return;
 
     return {
-      systemPrompt:
-        event.systemPrompt +
+      systemPrompt: [
+        ...event.systemPrompt,
         `
 
 ## Figma Remote MCP Server
 
-You have a live connection to Figma via the remote MCP server.
+Figma remote MCP tools were discovered during initialization. Tool discovery is not a current health check; file access and operations must be confirmed by their actual tool responses.
 
 The \`use_figma\` tool can **create, edit, and delete** content on the Figma canvas by executing Plugin API JavaScript. Use it for all canvas mutations. The \`search_design_system\` tool finds existing components and variables in connected libraries.
 
 **nodeId format:** Use \`123:456\` or \`123-456\`. Extract from Figma URLs: \`?node-id=1-2\` → \`1:2\`. If no nodeId is given, the tool uses whatever is currently selected in Figma.
 
 **Design-to-code workflow:** call \`get_screenshot\` first for visual reference, then \`get_design_context\` for layout and structure. If the response is too large, use \`get_metadata\` to get an overview, then \`get_design_context\` on specific child nodes.
-`,
+`, ],
     };
   });
 
@@ -669,19 +641,30 @@ The \`use_figma\` tool can **create, edit, and delete** content on the Figma can
         return;
       }
       ctx.ui.notify(
-        `Figma remote MCP server connected ✓\nURL: ${MCP_URL}\n\nAvailable tools (${availableTools.length}):\n${availableTools.map((t) => `  • ${t.name}`).join("\n")}`,
-        "success"
+        `Figma remote MCP tools discovered\nURL: ${MCP_URL}\nCurrent access is determined by actual tool responses, not this cached discovery state.\n\nAvailable tools (${availableTools.length}):\n${availableTools.map((t) => `  • ${t.name}`).join("\n")}`,
+        "info"
       );
     },
   });
 
   pi.registerCommand("figma-remote-auth", {
     description: "Authenticate with the Figma remote MCP server via OAuth",
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
+      if (args.trim() === "cancel") {
+        authController?.abort();
+        ctx.ui.notify("已取消本会话的 Figma 授权等待。", "info");
+        return;
+      }
+      if (authPending) {
+        ctx.ui.notify("Figma 授权已在进行；可使用 /figma-remote-auth cancel 取消。", "warning");
+        return;
+      }
+      authPending = true;
+      authController = new AbortController();
       try {
         await runFullOAuthFlow(ctx);
 
-        const signal = AbortSignal.timeout(15_000);
+        const signal = AbortSignal.any([AbortSignal.timeout(15_000), authController.signal]);
         const ok = await initializeSession(signal);
         if (!ok) {
           ctx.ui.notify(
@@ -696,11 +679,14 @@ The \`use_figma\` tool can **create, edit, and delete** content on the Figma can
         registerMcpTools(pi, tools);
         ctx.ui.notify(
           `Authenticated ✓\n\nAvailable tools (${tools.length}):\n${tools.map((t) => `  • ${t.name}`).join("\n")}`,
-          "success"
+          "info"
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Authentication error: ${msg}`, "error");
+      } finally {
+        authPending = false;
+        authController = undefined;
       }
     },
   });

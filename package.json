@@ -1,13 +1,26 @@
 {
   "name": "pi-figma-remote-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Connects pi-coding-agent to the Figma remote MCP server via OAuth2",
   "keywords": ["pi-package"],
-  "pi": {
-    "extensions": ["./index.ts"]
+  "type": "module",
+  "files": ["dist", "index.ts", "oauth-callback.ts", "scripts", "README.md", "test"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "npm run build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": { "typescript": "5.9.3", "typebox": "1.3.36" },
+  "engines": { "node": ">=22" },
+  "omp": {
+    "extensions": ["./dist/index.js"]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@oh-my-pi/pi-coding-agent": ">=18.14.0 <19",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
   }
 }
