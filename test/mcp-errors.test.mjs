@@ -24,14 +24,14 @@ after(async () => {
   await rm(home, { recursive: true, force: true });
 });
 
-async function fixture(call) {
+async function fixture(call, withSessionHeader = true) {
   const hooks = new Map();
   const tools = new Map();
   const requests = [];
   globalThis.fetch = async (url, init) => {
     const request = JSON.parse(init.body);
     requests.push({ url, request, authorization: init.headers.Authorization });
-    if (request.method === 'initialize') return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }), { headers: { 'content-type': 'application/json', 'mcp-session-id': 'fixture-session' } });
+    if (request.method === 'initialize') return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }), { headers: { 'content-type': 'application/json', ...(withSessionHeader ? { 'mcp-session-id': 'fixture-session' } : {}) } });
     if (request.method === 'tools/list') return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'whoami', description: 'Read-only fixture', inputSchema: { type: 'object', properties: {} } }] } }), { headers: { 'content-type': 'application/json' } });
     return await call(request, init);
   };
@@ -93,5 +93,45 @@ test('genuine HTTP 401 retains the existing authentication-required boundary', a
     assert.equal(result.isError, true);
     assert.equal(result.details, undefined);
     assert.equal(f.requests.filter(r => r.request.method === 'tools/call').length, 1);
+  } finally { f.close(); }
+});
+
+test('pre-tool initialization transport failure returns safe structured diagnostics without dispatching the tool', async () => {
+  const f = await fixture(async () => assert.fail('tool dispatched after failed initialization'), false);
+  let initializationAttempts = 0;
+  globalThis.fetch = async (_url, init) => {
+    assert.equal(JSON.parse(init.body).method, 'initialize');
+    initializationAttempts++;
+    throw new TypeError('fetch failed: initialization-message-secret', {
+      cause: Object.assign(new Error('initialization-cause-secret'), { code: 'ECONNRESET' }),
+    });
+  };
+  try {
+    const result = await f.tool.execute('initialization-failure', { sensitive: 'argument-secret' }, undefined);
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, 'Figma remote MCP error: HTTP request failed: TypeError <- Error[ECONNRESET]');
+    assert.deepEqual(result.details.figmaFailure, { stage: 'http-request', causes: 'TypeError <- Error[ECONNRESET]' });
+    assert.doesNotMatch(JSON.stringify(result), /fixture-access-token|initialization-message-secret|initialization-cause-secret|argument-secret/);
+    assert.equal(initializationAttempts, 1);
+    assert.equal(f.requests.filter(r => r.request.method === 'tools/call').length, 0);
+  } finally { f.close(); }
+});
+
+test('cancellation during pre-tool initialization preserves the original cancellation and dispatches no tool', async () => {
+  const f = await fixture(async () => assert.fail('tool dispatched after cancelled initialization'), false);
+  const controller = new AbortController();
+  const cancellation = new Error('explicit initialization cancellation');
+  let initializationAttempts = 0;
+  globalThis.fetch = async (_url, init) => {
+    assert.equal(JSON.parse(init.body).method, 'initialize');
+    initializationAttempts++;
+    init.signal.throwIfAborted();
+    assert.fail('cancelled initialization passed the signal boundary');
+  };
+  try {
+    controller.abort(cancellation);
+    await assert.rejects(f.tool.execute('initialization-cancelled', {}, controller.signal), error => error === cancellation);
+    assert.equal(initializationAttempts, 1);
+    assert.equal(f.requests.filter(r => r.request.method === 'tools/call').length, 0);
   } finally { f.close(); }
 });

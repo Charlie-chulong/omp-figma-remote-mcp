@@ -39,6 +39,13 @@ Explicit cancellation remains cancellation. Existing HTTP 401 authentication han
 
 A successful build and fixture test do not establish live Figma access. Verify the changed factory in the actual host with a read-only call before resuming canvas work. Never repeat an unknown-outcome mutation to test connectivity.
 
+## 1.0.2 verification
+
+- Pre-tool MCP initialization now uses the same sanitized error-result boundary as `tools/call`. Previously, an initialization transport error could escape without the `Figma remote MCP error` prefix or `details.figmaFailure`.
+- Six factory-level tests pass, including initialization failure with zero tool dispatch and preservation of the original initialization cancellation. The new transport case failed before the fix.
+- An isolated smoke program ran on the actual OMP bundled Node `v24.0.0-pre`: a real loopback connection was closed during pre-tool initialization; the result retained `stage: "http-request"` and the unified prefix, with no tool request, replay or credential/argument leakage. It made no request to Figma.
+- This repairs diagnostic coverage, not intermittent TLS connection resets. Loaded factories are not automatically replaced; real-account verification of this release is separate from the isolated smoke and does not justify force-reloading an active designer.
+
 ## 1.0.1 verification
 
 - Four factory-level regression tests passed: safe transport causes/no replay/no credential leakage, distinct remote RPC errors, explicit cancellation, and genuine HTTP 401 handling.

@@ -1,6 +1,6 @@
 {
   "name": "pi-figma-remote-mcp",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Connects pi-coding-agent to the Figma remote MCP server via OAuth2",
   "keywords": ["pi-package"],
   "type": "module",

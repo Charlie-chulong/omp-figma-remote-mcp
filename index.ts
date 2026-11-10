@@ -518,22 +518,25 @@ function registerMcpTools(pi: ExtensionAPI, tools: McpTool[]) {
       parameters: schema,
 
       async execute(_id, params, signal) {
-        if (!sessionId) {
-          const ok = await initializeSession(signal);
-          if (!ok) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Figma remote MCP session expired. Run /figma-remote-auth to re-authenticate.",
-                },
-              ],
-              isError: true,
-            };
-          }
-        }
-
+        let initializing = false;
         try {
+          if (!sessionId) {
+            initializing = true;
+            const ok = await initializeSession(signal);
+            initializing = false;
+            if (!ok) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Figma remote MCP session expired. Run /figma-remote-auth to re-authenticate.",
+                  },
+                ],
+                isError: true,
+              };
+            }
+          }
+
           const result = await callTool(
             tool.name,
             params as Record<string, unknown>,
@@ -544,6 +547,7 @@ function registerMcpTools(pi: ExtensionAPI, tools: McpTool[]) {
             isError: result.isError ?? false,
           };
         } catch (err: unknown) {
+          if (initializing && (signal?.aborted || lifecycle.signal.aborted)) throw err;
           const msg = err instanceof Error ? err.message : String(err);
           if (msg === "AUTH_REQUIRED") {
             accessToken = undefined;
